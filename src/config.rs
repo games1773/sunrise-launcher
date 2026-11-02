@@ -4,21 +4,35 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Session;
 use crate::{paths, Result};
+
+/// How the game is told who is playing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountMode {
+    /// A name, no session: singleplayer, LAN and offline-mode servers.
+    #[default]
+    Offline,
+    /// A Microsoft session, which also lets online-mode servers accept the player.
+    Microsoft,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The official launcher's game folder; `None` means "find it".
     pub minecraft_dir: Option<PathBuf>,
-    /// The 26.3 server jar, needed once by the preparer.
-    pub server_jar: Option<PathBuf>,
     /// Java 25 home to prepare with; `None` means "whatever the preparer finds".
     pub java_home: Option<PathBuf>,
     /// Copy the ~380 MB of sounds while preparing (the game is silent without them).
     pub copy_sounds: bool,
     /// The offline name the game plays as.
     pub player_name: String,
+    /// Offline (the default) or the Microsoft session.
+    pub account: AccountMode,
+    /// The signed-in or imported session. Holds tokens, so the file is private.
+    pub session: Option<Session>,
     /// The build tag picked last, reused for new instances.
     pub last_build: Option<String>,
 }
@@ -27,10 +41,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             minecraft_dir: None,
-            server_jar: None,
             java_home: None,
             copy_sounds: true,
             player_name: default_player_name(),
+            account: AccountMode::default(),
+            session: None,
             last_build: None,
         }
     }
@@ -164,7 +179,10 @@ impl Config {
                 // Keep the broken file instead of overwriting the player's setup.
                 let backup = file.with_extension(format!("json.broken-{}", crate::now_secs()));
                 let _ = std::fs::rename(&file, &backup);
-                eprintln!("sunrise: sunrise.json could not be read ({err}); kept as {}", backup.display());
+                eprintln!(
+                    "sunrise: sunrise.json could not be read ({err}); kept as {}",
+                    backup.display()
+                );
                 let mut config = Config::default();
                 config.ensure_instance(data);
                 config
@@ -176,7 +194,8 @@ impl Config {
         paths::ensure_dir(data)?;
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         let file = paths::config_file(data);
-        std::fs::write(&file, text).map_err(|e| format!("could not save {}: {e}", file.display()))?;
+        std::fs::write(&file, text)
+            .map_err(|e| format!("could not save {}: {e}", file.display()))?;
         // The file can hold a session token: keep it to this user on Unix. On
         // Windows the data folder already lives under the user's %APPDATA%.
         #[cfg(unix)]
@@ -188,6 +207,11 @@ impl Config {
     }
 
     fn ensure_instance(&mut self, data: &Path) {
+        // An empty name only ever means "never set" (older files could hold one);
+        // without a name the game cannot start, so fall back to the default.
+        if self.settings.player_name.trim().is_empty() {
+            self.settings.player_name = default_player_name();
+        }
         if self.instances.is_empty() {
             let dir = paths::instances_dir(data).join("main");
             let mut instance = Instance::new("Main", dir);
@@ -260,6 +284,54 @@ mod tests {
         assert!(!valid_player_name("this-name-is-too-long"));
         assert!(!valid_player_name("space name"));
         assert!(!valid_player_name(""));
+    }
+
+    #[test]
+    fn an_older_sunrise_json_still_loads() {
+        // Files written before the server jar became Sunrise's job carry
+        // "server_jar"; the field is gone now and must not break the load.
+        let dir = std::env::temp_dir().join(format!("sunrise-migrate-{}", crate::now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            paths::config_file(&dir),
+            r#"{
+                "settings": {
+                    "server_jar": "C:/Users/Player/server.jar",
+                    "player_name": "Alex",
+                    "copy_sounds": false
+                },
+                "instances": [],
+                "selected_instance": null
+            }"#,
+        )
+        .unwrap();
+        let config = Config::load(&dir);
+        assert_eq!(config.settings.player_name, "Alex");
+        // An empty name is read back as the default, so Play is never dead on
+        // arrival.
+        assert!(!config.settings.copy_sounds);
+        assert_eq!(config.settings.account, AccountMode::Offline);
+        assert!(config.settings.session.is_none());
+        assert_eq!(config.instances.len(), 1);
+        // Saving writes the new shape, without the dead field.
+        config.save(&dir).unwrap();
+        let text = std::fs::read_to_string(paths::config_file(&dir)).unwrap();
+        assert!(!text.contains("server_jar"));
+        assert!(text.contains("\"account\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_name_falls_back_to_the_default() {
+        let dir = std::env::temp_dir().join(format!("sunrise-empty-{}", crate::now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            paths::config_file(&dir),
+            r#"{"settings":{"player_name":"  "},"instances":[],"selected_instance":null}"#,
+        )
+        .unwrap();
+        assert_eq!(Config::load(&dir).settings.player_name, "Player");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

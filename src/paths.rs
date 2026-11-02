@@ -58,10 +58,8 @@ pub fn slug(name: &str) -> String {
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
-        } else if ch.is_whitespace() || ch == '-' || ch == '_' {
-            if !out.ends_with('-') {
-                out.push('-');
-            }
+        } else if (ch.is_whitespace() || ch == '-' || ch == '_') && !out.ends_with('-') {
+            out.push('-');
         }
     }
     let trimmed = out.trim_matches('-').to_string();

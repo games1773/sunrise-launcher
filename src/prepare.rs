@@ -32,7 +32,6 @@ pub struct SetupStatus {
     pub build_installed: bool,
     pub minecraft_found: bool,
     pub java_found: bool,
-    pub server_jar: bool,
     pub prepared: bool,
 }
 
@@ -46,22 +45,22 @@ impl SetupStatus {
             self.build_installed,
             self.minecraft_found,
             self.java_found,
-            self.server_jar,
             self.prepared,
         ]
         .iter()
         .filter(|v| **v)
         .count();
-        (done, 5)
+        (done, 4)
     }
 }
 
-pub fn status(build_dir: Option<&Path>, detection: Option<&Detection>, server_jar: Option<&Path>) -> SetupStatus {
+pub fn status(build_dir: Option<&Path>, detection: Option<&Detection>) -> SetupStatus {
     SetupStatus {
-        build_installed: build_dir.map(|dir| builds::client_exe(dir).is_file()).unwrap_or(false),
+        build_installed: build_dir
+            .map(|dir| builds::client_exe(dir).is_file())
+            .unwrap_or(false),
         minecraft_found: detection.map(|d| d.has_game_version()).unwrap_or(false),
         java_found: detection.map(|d| d.java_ready()).unwrap_or(false),
-        server_jar: server_jar.map(|p| p.is_file()).unwrap_or(false),
         prepared: build_dir.map(is_prepared).unwrap_or(false),
     }
 }
@@ -69,7 +68,6 @@ pub fn status(build_dir: Option<&Path>, detection: Option<&Detection>, server_ja
 fn base_command(prepare: &Path, build_dir: &Path, java_home: Option<&Path>) -> Command {
     let mut cmd = Command::new(prepare);
     cmd.current_dir(build_dir);
-    cmd.arg("--root").arg(build_dir);
     if let Some(home) = java_home {
         cmd.env("JAVA_HOME", home);
     }
@@ -91,7 +89,7 @@ pub fn prepare_command(
         ));
     }
     let mut cmd = base_command(&prepare, build_dir, java_home);
-    cmd.arg("--prepare");
+    cmd.arg("--prepare").arg("--root").arg(build_dir);
     if let Some(dir) = minecraft_dir {
         cmd.arg("--minecraft-dir").arg(dir);
     }
@@ -115,7 +113,9 @@ pub fn sounds_command(
         ));
     }
     let mut cmd = base_command(&prepare, build_dir, java_home);
-    cmd.arg("sounds");
+    // This build's parser only takes the subcommand as the first argument; before
+    // --root it answers "unrecognized argument: sounds" and exits 2.
+    cmd.arg("sounds").arg("--root").arg(build_dir);
     if let Some(dir) = minecraft_dir {
         cmd.arg("--minecraft-dir").arg(dir);
     }
@@ -123,11 +123,7 @@ pub fn sounds_command(
 }
 
 /// Human-readable reason the preparer cannot run yet, if any.
-pub fn blocker(
-    build_dir: Option<&Path>,
-    detection: Option<&Detection>,
-    server_jar: Option<&Path>,
-) -> Option<String> {
+pub fn blocker(build_dir: Option<&Path>, detection: Option<&Detection>) -> Option<String> {
     let Some(build_dir) = build_dir else {
         return Some("Install a Horizon build first.".to_string());
     };
@@ -145,15 +141,9 @@ pub fn blocker(
     }
     if !detection.java_ready() {
         return Some(format!(
-            "Preparing needs Java {} - install it, or point Sunrise at a Java {} home in Settings.",
+            "Preparing needs Java {} - install it, or point Sunrise at a Java {} home.",
             crate::detect::REQUIRED_JAVA_MAJOR,
             crate::detect::REQUIRED_JAVA_MAJOR
-        ));
-    }
-    if server_jar.map(|p| p.is_file()).unwrap_or(false) == false && !is_prepared(build_dir) {
-        return Some(format!(
-            "The first preparation needs the {} server jar (downloads.server in your launcher's versions/{0}/{0}.json). Choose it in Settings.",
-            crate::detect::GAME_VERSION
         ));
     }
     None
@@ -162,6 +152,34 @@ pub fn blocker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sounds_subcommand_comes_first() {
+        // The shipped parser treats its first argument as the subcommand, so
+        // `--root X sounds` is refused with exit code 2.
+        let dir = std::env::temp_dir().join(format!("sunrise-sounds-{}", crate::now_secs()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(builds::prepare_exe(&dir), b"").unwrap();
+
+        let sounds = sounds_command(&dir, None, None).unwrap();
+        let args: Vec<String> = sounds
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("sounds"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--root" && w[1] == dir.display().to_string()));
+
+        let prepare = prepare_command(&dir, None, None, None).unwrap();
+        let args: Vec<String> = prepare
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args.contains(&"--prepare".to_string()));
+        assert!(!args.contains(&"sounds".to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn resources_are_ready_only_with_the_marker() {

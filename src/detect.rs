@@ -26,7 +26,7 @@ pub struct JavaInfo {
 
 impl JavaInfo {
     pub fn is_usable(&self) -> bool {
-        self.major == REQUIRED_JAVA_MAJOR || self.major > REQUIRED_JAVA_MAJOR
+        self.major >= REQUIRED_JAVA_MAJOR
     }
 }
 
@@ -36,7 +36,6 @@ pub struct Detection {
     /// The install Sunrise would prepare from.
     pub chosen: Option<MinecraftInstall>,
     pub java: Option<JavaInfo>,
-    pub server_jar: Option<PathBuf>,
 }
 
 impl Detection {
@@ -223,16 +222,10 @@ pub fn detect(settings: &Settings) -> Detection {
 
     let java = detect_java(settings, chosen.as_ref().map(|c| c.dir.as_path()));
 
-    let server_jar = settings
-        .server_jar
-        .clone()
-        .filter(|path| path.is_file());
-
     Detection {
         installs,
         chosen,
         java,
-        server_jar,
     }
 }
 

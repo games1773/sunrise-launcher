@@ -94,6 +94,9 @@ pub struct GameSpec {
     pub extra_args: String,
     /// The offline player name handed over as `--name`.
     pub name: Option<String>,
+    /// A Microsoft session. When present the game signs in with it, so no
+    /// offline name is passed and online-mode servers accept the player.
+    pub session: Option<crate::auth::Session>,
     /// `host[:port]` joined at start, for offline-mode servers.
     pub server: Option<String>,
 }
@@ -106,14 +109,14 @@ impl GameSpec {
 
 /// The arguments handed to the client, in the order the Launch API lists them.
 pub fn build_args(spec: &GameSpec, caps: &Caps) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-
-    args.push("--resources".into());
-    args.push(spec.resources_dir().display().to_string());
-    args.push("--game-dir".into());
-    args.push(spec.game_dir.display().to_string());
-    args.push("--home".into());
-    args.push(spec.home.display().to_string());
+    let mut args: Vec<String> = vec![
+        "--resources".into(),
+        spec.resources_dir().display().to_string(),
+        "--game-dir".into(),
+        spec.game_dir.display().to_string(),
+        "--home".into(),
+        spec.home.display().to_string(),
+    ];
 
     if spec.width > 0 && spec.height > 0 {
         args.push("--width".into());
@@ -125,7 +128,11 @@ pub fn build_args(spec: &GameSpec, caps: &Caps) -> Vec<String> {
         args.push("--fullscreen".into());
     }
 
-    let server = spec.server.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let server = spec
+        .server
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     if let Some(server) = server {
         if caps.supports("--quickPlayMultiplayer") {
             args.push("--quickPlayMultiplayer".into());
@@ -148,21 +155,39 @@ pub fn build_args(spec: &GameSpec, caps: &Caps) -> Vec<String> {
         } else {
             args.push("--world".into());
             args.push(world.to_string());
-            if let Some(seed) = spec.seed.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(seed) = spec
+                .seed
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 args.push("--seed".into());
                 args.push(seed.to_string());
             }
         }
     }
 
-    if let Some(name) = spec.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-        if caps.supports("--name") {
-            args.push("--name".into());
-            args.push(name.to_string());
+    // A session carries the account's own name, so the offline name would only
+    // fight it.
+    if spec.session.is_none() {
+        if let Some(name) = spec
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            if caps.supports("--name") {
+                args.push("--name".into());
+                args.push(name.to_string());
+            }
         }
     }
+    if spec.session.is_some() && caps.supports("--session-stdin") {
+        args.push("--session-stdin".into());
+    }
 
-    if spec.render_distance > 0 && spec.render_distance != 12 && caps.supports("--render-distance") {
+    if spec.render_distance > 0 && spec.render_distance != 12 && caps.supports("--render-distance")
+    {
         args.push("--render-distance".into());
         args.push(spec.render_distance.to_string());
     }
@@ -179,8 +204,9 @@ pub fn build_args(spec: &GameSpec, caps: &Caps) -> Vec<String> {
     args
 }
 
-/// Start the game with its output captured. No account session is handed over:
-/// Horizon plays offline with the name `--name` gives it.
+/// Start the game with its output captured. Without a session it plays offline
+/// with the name `--name` gives it; with one, the session goes over stdin the way
+/// the Launch API asks, and is never put on the command line.
 pub fn spawn(
     spec: &GameSpec,
     caps: &Caps,
@@ -221,7 +247,12 @@ pub fn spawn(
             .join(" ")
     );
 
-    let pid = crate::spawn_streamed(cmd, crate::Job::Game, tx.clone())?;
+    let payload = if args.iter().any(|a| a == "--session-stdin") {
+        spec.session.as_ref().map(|s| s.handover_json())
+    } else {
+        None
+    };
+    let pid = crate::spawn_streamed(cmd, crate::Job::Game, tx.clone(), payload)?;
     let _ = tx.send(crate::Event::GameSpawned {
         pid,
         command: command_line,
@@ -268,6 +299,7 @@ mod tests {
             creative: false,
             extra_args: String::new(),
             name: None,
+            session: None,
             server: None,
         }
     }
@@ -312,7 +344,10 @@ mod tests {
         let mut spec = spec();
         spec.name = Some("Alex".into());
         spec.server = Some("192.168.1.20:25565".into());
-        let args = build_args(&spec, &caps("--name NAME\n--quickPlayMultiplayer HOST[:PORT]"));
+        let args = build_args(
+            &spec,
+            &caps("--name NAME\n--quickPlayMultiplayer HOST[:PORT]"),
+        );
         let name_at = args.iter().position(|a| a == "--name").unwrap();
         assert_eq!(args[name_at + 1], "Alex");
         let server_at = args
@@ -328,6 +363,37 @@ mod tests {
         spec.name = Some("Alex".into());
         let args = build_args(&spec, &caps("--resources PATH"));
         assert!(!args.contains(&"--name".to_string()));
+    }
+
+    #[test]
+    fn a_session_replaces_the_offline_name() {
+        let mut spec = spec();
+        spec.name = Some("Player".into());
+        spec.session = Some(crate::auth::Session {
+            name: "Alex".into(),
+            uuid: "069a79f444e94726a5befca90e38aaf5".into(),
+            access_token: "tok".into(),
+            user_type: "msa".into(),
+            xuid: None,
+            checked_at: 1,
+            ..Default::default()
+        });
+        let args = build_args(
+            &spec,
+            &caps("--name NAME\n--session-stdin\n--quickPlayMultiplayer HOST[:PORT]"),
+        );
+        assert!(args.contains(&"--session-stdin".to_string()));
+        assert!(!args.contains(&"--name".to_string()));
+        // The token must never travel on the command line.
+        assert!(!args.iter().any(|a| a == "tok"));
+    }
+
+    #[test]
+    fn a_build_without_session_stdin_is_not_asked_for_one() {
+        let mut spec = spec();
+        spec.session = Some(crate::auth::Session::default());
+        let args = build_args(&spec, &caps("--resources PATH\n--name NAME"));
+        assert!(!args.contains(&"--session-stdin".to_string()));
     }
 
     #[test]

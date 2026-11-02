@@ -5,10 +5,13 @@
 //! finding and installing builds, preparing the game files from the player's own
 //! Minecraft install, and starting `horizon-client` with its output captured.
 
+pub mod auth;
 pub mod builds;
 pub mod config;
 pub mod detect;
 pub mod launch;
+pub mod microsoft;
+pub mod mojang;
 pub mod paths;
 pub mod prepare;
 
@@ -82,6 +85,31 @@ pub enum Event {
         pid: u32,
         command: String,
     },
+    /// The server jar Sunrise downloads once from Mojang.
+    ServerJarProgress {
+        done: u64,
+        total: u64,
+        message: String,
+    },
+    ServerJarReady {
+        path: Option<std::path::PathBuf>,
+        error: Option<String>,
+    },
+    /// An imported or signed-in Microsoft session came back from Mojang's check.
+    SessionChecked {
+        session: Option<Box<auth::Session>>,
+        warning: Option<String>,
+        error: Option<String>,
+    },
+    /// Microsoft handed out a code for the player to type in the browser.
+    SignInCode {
+        code: Option<Box<microsoft::DeviceCode>>,
+        error: Option<String>,
+    },
+    /// A sign-in stopped without a session: cancelled, expired or refused.
+    SignInEnded {
+        error: Option<String>,
+    },
     /// A build answered `--launch-api` and `--help`.
     CapsProbed {
         tag: String,
@@ -103,13 +131,19 @@ pub fn spawn_streamed(
     mut cmd: std::process::Command,
     job: Job,
     tx: Sender<Event>,
+    stdin_payload: Option<String>,
 ) -> Result<u32> {
+    use std::io::Write;
     use std::process::Stdio;
 
     let program = cmd.get_program().to_string_lossy().to_string();
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdin(if stdin_payload.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
 
     // The preparer is a console program; without this a console window flashes
     // open next to the launcher.
@@ -126,6 +160,14 @@ pub fn spawn_streamed(
         .map_err(|e| format!("could not start {program}: {e}"))?;
 
     let pid = child.id();
+
+    // The Launch API reads the session from stdin; closing it afterwards is what
+    // tells the game the JSON is complete.
+    if let Some(payload) = stdin_payload {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(payload.as_bytes());
+        }
+    }
 
     fn forward<R: std::io::Read + Send + 'static>(
         pipe: R,

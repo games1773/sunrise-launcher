@@ -167,7 +167,10 @@ pub fn fetch_builds(data: &Path, force: bool) -> Result<Vec<RemoteBuild>> {
         });
         builds.push(RemoteBuild {
             tag: release.tag_name.clone(),
-            label: release.name.clone().unwrap_or_else(|| release.tag_name.clone()),
+            label: release
+                .name
+                .clone()
+                .unwrap_or_else(|| release.tag_name.clone()),
             prerelease: release.prerelease,
             published_at: release.published_at.unwrap_or_default(),
             asset_name: asset.name.clone(),
@@ -178,7 +181,8 @@ pub fn fetch_builds(data: &Path, force: bool) -> Result<Vec<RemoteBuild>> {
         });
     }
 
-    builds.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    // Newest first, by the release's own timestamp.
+    builds.sort_by_key(|b| std::cmp::Reverse(b.published_at.clone()));
 
     let _ = paths::ensure_dir(data);
     if let Ok(text) = serde_json::to_string(&Cache {
@@ -189,9 +193,7 @@ pub fn fetch_builds(data: &Path, force: bool) -> Result<Vec<RemoteBuild>> {
     }
 
     if builds.is_empty() {
-        return Err(format!(
-            "no release of {REPO} carries {asset_name} yet"
-        ));
+        return Err(format!("no release of {REPO} carries {asset_name} yet"));
     }
     Ok(builds)
 }
@@ -244,6 +246,19 @@ pub fn game_version(build_dir: &Path) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| "26.3".to_string())
+}
+
+/// The server jar's SHA-1 as the build pins it: the preparer checks the same
+/// value, so Sunrise downloads exactly the file Horizon expects.
+pub fn pinned_server_sha1(build_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(build_dir.join("research-lock.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("minecraft")
+        .and_then(|m| m.get("server_sha1"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_ascii_lowercase())
+        .filter(|v| v.len() == 40)
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -307,7 +322,7 @@ pub fn installed_builds(data: &Path) -> Vec<InstalledBuild> {
             installed_at: marker.installed_at,
         });
     }
-    out.sort_by(|a, b| a.installed_at.cmp(&b.installed_at));
+    out.sort_by_key(|b| b.installed_at);
     out
 }
 
@@ -366,7 +381,8 @@ pub fn install(
     }
 
     let total = response.content_length().unwrap_or(build.size);
-    let mut file = File::create(&part).map_err(|e| format!("could not write {}: {e}", part.display()))?;
+    let mut file =
+        File::create(&part).map_err(|e| format!("could not write {}: {e}", part.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     let mut done: u64 = 0;
@@ -399,8 +415,7 @@ pub fn install(
             ));
         }
     }
-    std::fs::rename(&part, &archive)
-        .map_err(|e| format!("could not keep the download: {e}"))?;
+    std::fs::rename(&part, &archive).map_err(|e| format!("could not keep the download: {e}"))?;
 
     progress(Progress {
         done: total.max(done),
@@ -439,7 +454,12 @@ pub fn install(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for name in ["horizon-client", "horizon-prepare", "horizon-ctl", "horizon-server"] {
+        for name in [
+            "horizon-client",
+            "horizon-prepare",
+            "horizon-ctl",
+            "horizon-server",
+        ] {
             let path = target.join(name);
             if path.is_file() {
                 if let Ok(meta) = std::fs::metadata(&path) {
@@ -494,7 +514,8 @@ fn unpack(archive: &Path, dest: &Path) -> Result<PathBuf> {
 
     if name.ends_with(".zip") {
         let file = File::open(archive).map_err(|e| format!("could not open the archive: {e}"))?;
-        let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("could not read the zip: {e}"))?;
+        let mut zip =
+            zip::ZipArchive::new(file).map_err(|e| format!("could not read the zip: {e}"))?;
         for index in 0..zip.len() {
             let mut entry = zip
                 .by_index(index)
